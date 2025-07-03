@@ -3,6 +3,13 @@
 (define-data-var last-token-id uint u0)
 (define-data-var contract-owner principal tx-sender)
 
+(define-data-var platform-fee-rate uint u250)
+(define-data-var marketplace-owner principal tx-sender)
+
+(define-constant ERR-INSUFFICIENT-FUNDS (err u402))
+(define-constant ERR-INVALID-PRICE (err u400))
+(define-constant ERR-LISTING-INACTIVE (err u403))
+
 (define-map token-metadata uint {
     name: (string-ascii 64),
     description: (string-ascii 256),
@@ -230,5 +237,130 @@
         current-activity-score: current-score,
         blocks-since-last: (- stacks-block-height (get last-interaction activity))
     })
+    )
+)
+
+
+(define-map listings uint {
+    seller: principal,
+    price: uint,
+    active: bool,
+    base-price: uint,
+    level-multiplier: uint
+})
+
+(define-map marketplace-stats principal {
+    total-sales: uint,
+    total-purchases: uint,
+    reputation-score: uint
+})
+
+
+
+(define-trait nft-trait
+    (
+        (get-owner (uint) (response (optional principal) uint))
+        (transfer (uint principal principal) (response bool uint))
+        (get-nft-level (uint) (response uint uint))
+    )
+)
+
+(define-public (list-nft (nft-contract <nft-trait>) (token-id uint) (base-price uint) (level-multiplier uint))
+    (let (
+        (owner-result (contract-call? nft-contract get-owner token-id))
+        (level-result (contract-call? nft-contract get-nft-level token-id))
+    )
+    (asserts! (> base-price u0) ERR-INVALID-PRICE)
+    (asserts! (> level-multiplier u0) ERR-INVALID-PRICE)
+    (match owner-result
+        owner-opt (match owner-opt
+            owner (begin
+                (asserts! (is-eq tx-sender owner) ERR-NOT-AUTHORIZED)
+                (match level-result
+                    level (let (
+                        (dynamic-price (+ base-price (* level level-multiplier)))
+                    )
+                    (map-set listings token-id {
+                        seller: tx-sender,
+                        price: dynamic-price,
+                        active: true,
+                        base-price: base-price,
+                        level-multiplier: level-multiplier
+                    })
+                    (ok dynamic-price))
+                    err-level ERR-NOT-FOUND
+                )
+            )
+            ERR-NOT-FOUND
+        )
+        err-owner ERR-NOT-FOUND
+    ))
+)
+
+(define-public (purchase-nft (nft-contract <nft-trait>) (token-id uint))
+    (let (
+        (listing (unwrap! (map-get? listings token-id) ERR-NOT-FOUND))
+        (seller (get seller listing))
+        (price (get price listing))
+        (platform-fee (/ (* price (var-get platform-fee-rate)) u10000))
+        (seller-amount (- price platform-fee))
+    )
+    (asserts! (get active listing) ERR-LISTING-INACTIVE)
+    (asserts! (>= (stx-get-balance tx-sender) price) ERR-INSUFFICIENT-FUNDS)
+    (try! (stx-transfer? seller-amount tx-sender seller))
+    (try! (stx-transfer? platform-fee tx-sender (var-get marketplace-owner)))
+    (try! (contract-call? nft-contract transfer token-id seller tx-sender))
+    (map-set listings token-id (merge listing {active: false}))
+    (update-marketplace-stats seller true)
+    (update-marketplace-stats tx-sender false)
+    (ok true)
+    )
+)
+
+(define-public (cancel-listing (token-id uint))
+    (let (
+        (listing (unwrap! (map-get? listings token-id) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get seller listing)) ERR-NOT-AUTHORIZED)
+    (asserts! (get active listing) ERR-LISTING-INACTIVE)
+    (map-set listings token-id (merge listing {active: false}))
+    (ok true)
+    )
+)
+
+(define-private (update-marketplace-stats (user principal) (is-seller bool))
+    (let (
+        (current-stats (default-to {total-sales: u0, total-purchases: u0, reputation-score: u0} 
+                       (map-get? marketplace-stats user)))
+    )
+    (if is-seller
+        (map-set marketplace-stats user {
+            total-sales: (+ (get total-sales current-stats) u1),
+            total-purchases: (get total-purchases current-stats),
+            reputation-score: (+ (get reputation-score current-stats) u10)
+        })
+        (map-set marketplace-stats user {
+            total-sales: (get total-sales current-stats),
+            total-purchases: (+ (get total-purchases current-stats) u1),
+            reputation-score: (+ (get reputation-score current-stats) u5)
+        })
+    )
+    )
+)
+
+(define-read-only (get-listing (token-id uint))
+    (map-get? listings token-id)
+)
+
+(define-read-only (get-marketplace-stats (user principal))
+    (map-get? marketplace-stats user)
+)
+
+(define-public (set-platform-fee (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get marketplace-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= new-rate u1000) ERR-INVALID-PRICE)
+        (var-set platform-fee-rate new-rate)
+        (ok true)
     )
 )
