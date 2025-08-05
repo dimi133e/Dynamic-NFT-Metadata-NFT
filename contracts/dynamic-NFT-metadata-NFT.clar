@@ -364,3 +364,106 @@
         (ok true)
     )
 )
+
+(define-constant BASE-REWARD-RATE u10)
+(define-constant REWARD-POOL-REFILL u1000000)
+(define-constant MIN-STAKE-DURATION u144)
+
+(define-data-var rewards-pool uint u0)
+(define-data-var total-staked uint u0)
+
+(define-map staked-tokens uint {
+    owner: principal,
+    stake-start: uint,
+    last-claim: uint
+})
+
+(define-map user-stakes principal (list 50 uint))
+
+(define-read-only (get-staking-rewards (token-id uint))
+    (match (map-get? staked-tokens token-id)
+        stake-info (let (
+            (blocks-staked (- stacks-block-height (get last-claim stake-info)))
+            (token-meta (unwrap! (map-get? token-metadata token-id) ERR-NOT-FOUND))
+            (nft-level (get level token-meta))
+            (base-reward (* blocks-staked BASE-REWARD-RATE))
+            (level-bonus (* base-reward nft-level))
+        )
+        (ok (+ base-reward level-bonus)))
+        (ok u0)
+    )
+)
+
+(define-public (stake-nft (token-id uint))
+    (let (
+        (token-owner (unwrap! (nft-get-owner? dynamic-nft token-id) ERR-NOT-FOUND))
+        (user-token-list (default-to (list) (map-get? user-stakes tx-sender)))
+    )
+    (asserts! (is-eq tx-sender token-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (is-none (map-get? staked-tokens token-id)) ERR-ALREADY-EXISTS)
+    (asserts! (< (len user-token-list) u50) ERR-INVALID-INPUT)
+    (map-set staked-tokens token-id {
+        owner: tx-sender,
+        stake-start: stacks-block-height,
+        last-claim: stacks-block-height
+    })
+    (map-set user-stakes tx-sender (unwrap! (as-max-len? (append user-token-list token-id) u50) ERR-INVALID-INPUT))
+    (var-set total-staked (+ (var-get total-staked) u1))
+    (ok true)
+    )
+)
+
+(define-public (unstake-nft (token-id uint))
+    (let (
+        (stake-info (unwrap! (map-get? staked-tokens token-id) ERR-NOT-FOUND))
+        (stake-duration (- stacks-block-height (get stake-start stake-info)))
+    )
+    (asserts! (is-eq tx-sender (get owner stake-info)) ERR-NOT-AUTHORIZED)
+    (asserts! (>= stake-duration MIN-STAKE-DURATION) ERR-INVALID-INPUT)
+    (try! (claim-staking-rewards token-id))
+    (map-delete staked-tokens token-id)
+    (map-delete user-stakes tx-sender)
+    (var-set total-staked (- (var-get total-staked) u1))
+    (ok true)
+    )
+)
+
+(define-public (claim-staking-rewards (token-id uint))
+    (let (
+        (stake-info (unwrap! (map-get? staked-tokens token-id) ERR-NOT-FOUND))
+        (earned-rewards (unwrap! (get-staking-rewards token-id) ERR-NOT-FOUND))
+        (available-pool (var-get rewards-pool))
+        (payout (if (>= available-pool earned-rewards) earned-rewards available-pool))
+    )
+    (asserts! (is-eq tx-sender (get owner stake-info)) ERR-NOT-AUTHORIZED)
+    (asserts! (> payout u0) ERR-INSUFFICIENT-FUNDS)
+    (try! (as-contract (stx-transfer? payout tx-sender (get owner stake-info))))
+    (map-set staked-tokens token-id (merge stake-info {last-claim: stacks-block-height}))
+    (var-set rewards-pool (- available-pool payout))
+    (ok payout)
+    )
+)
+
+(define-public (fund-rewards-pool (amount uint))
+    (begin
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set rewards-pool (+ (var-get rewards-pool) amount))
+        (ok true)
+    )
+)
+
+(define-read-only (get-user-staked-tokens (user principal))
+    (ok (map-get? user-stakes user))
+)
+
+(define-read-only (get-staking-info (token-id uint))
+    (ok (map-get? staked-tokens token-id))
+)
+
+(define-read-only (get-rewards-pool)
+    (var-get rewards-pool)
+)
+
+(define-read-only (get-total-staked)
+    (var-get total-staked)
+)
