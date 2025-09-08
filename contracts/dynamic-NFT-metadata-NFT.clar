@@ -467,3 +467,103 @@
 (define-read-only (get-total-staked)
     (var-get total-staked)
 )
+
+(define-constant BREEDING-COOLDOWN u1000)
+(define-constant BREEDING-COST u1000000)
+(define-constant MIN-BREEDING-LEVEL u2)
+
+(define-map breeding-cooldowns uint uint)
+(define-map breeding-pairs {parent1: uint, parent2: uint} uint)
+
+(define-read-only (can-breed (token-id uint))
+    (let (
+        (last-breed (default-to u0 (map-get? breeding-cooldowns token-id)))
+        (blocks-since (- stacks-block-height last-breed))
+    )
+    (>= blocks-since BREEDING-COOLDOWN))
+)
+
+(define-private (calculate-offspring-traits (parent1-meta {name: (string-ascii 64), description: (string-ascii 256), image-base-uri: (string-ascii 256), level: uint, experience: uint, last-activity: uint}) (parent2-meta {name: (string-ascii 64), description: (string-ascii 256), image-base-uri: (string-ascii 256), level: uint, experience: uint, last-activity: uint}))
+    (let (
+        (combined-level (+ (get level parent1-meta) (get level parent2-meta)))
+        (avg-level (/ combined-level u2))
+        (bonus-exp (+ (get experience parent1-meta) (get experience parent2-meta)))
+        (offspring-level (if (> avg-level MAX-LEVEL) MAX-LEVEL avg-level))
+        (offspring-exp (+ bonus-exp u50))
+    )
+    {
+        level: offspring-level,
+        experience: offspring-exp,
+        combined-heritage: combined-level
+    })
+)
+
+(define-public (breed-nfts (parent1-id uint) (parent2-id uint) (offspring-name (string-ascii 64)) (offspring-desc (string-ascii 256)) (offspring-uri (string-ascii 256)))
+    (let (
+        (parent1-owner (unwrap! (nft-get-owner? dynamic-nft parent1-id) ERR-NOT-FOUND))
+        (parent2-owner (unwrap! (nft-get-owner? dynamic-nft parent2-id) ERR-NOT-FOUND))
+        (parent1-meta (unwrap! (map-get? token-metadata parent1-id) ERR-NOT-FOUND))
+        (parent2-meta (unwrap! (map-get? token-metadata parent2-id) ERR-NOT-FOUND))
+        (offspring-traits (calculate-offspring-traits parent1-meta parent2-meta))
+        (new-token-id (+ (var-get last-token-id) u1))
+    )
+    (asserts! (is-eq tx-sender parent1-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender parent2-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq parent1-id parent2-id)) ERR-INVALID-INPUT)
+    (asserts! (>= (get level parent1-meta) MIN-BREEDING-LEVEL) ERR-INVALID-INPUT)
+    (asserts! (>= (get level parent2-meta) MIN-BREEDING-LEVEL) ERR-INVALID-INPUT)
+    (asserts! (can-breed parent1-id) ERR-INVALID-INPUT)
+    (asserts! (can-breed parent2-id) ERR-INVALID-INPUT)
+    (asserts! (>= (stx-get-balance tx-sender) BREEDING-COST) ERR-INSUFFICIENT-FUNDS)
+    (try! (stx-transfer? BREEDING-COST tx-sender (var-get contract-owner)))
+    (try! (nft-mint? dynamic-nft new-token-id tx-sender))
+    (map-set token-metadata new-token-id {
+        name: offspring-name,
+        description: offspring-desc,
+        image-base-uri: offspring-uri,
+        level: (get level offspring-traits),
+        experience: (get experience offspring-traits),
+        last-activity: stacks-block-height
+    })
+    (map-set token-owners new-token-id tx-sender)
+    (map-set breeding-cooldowns parent1-id stacks-block-height)
+    (map-set breeding-cooldowns parent2-id stacks-block-height)
+    (map-set breeding-pairs {parent1: parent1-id, parent2: parent2-id} new-token-id)
+    (var-set last-token-id new-token-id)
+    (ok new-token-id)
+    )
+)
+
+(define-read-only (get-breeding-cooldown (token-id uint))
+    (let (
+        (last-breed (default-to u0 (map-get? breeding-cooldowns token-id)))
+        (blocks-since (- stacks-block-height last-breed))
+        (remaining (if (>= blocks-since BREEDING-COOLDOWN) u0 (- BREEDING-COOLDOWN blocks-since)))
+    )
+    (ok {
+        last-breed-block: last-breed,
+        blocks-since-breed: blocks-since,
+        cooldown-remaining: remaining,
+        can-breed-now: (>= blocks-since BREEDING-COOLDOWN)
+    }))
+)
+
+(define-read-only (get-offspring-info (parent1-id uint) (parent2-id uint))
+    (ok (map-get? breeding-pairs {parent1: parent1-id, parent2: parent2-id}))
+)
+
+(define-read-only (simulate-breeding (parent1-id uint) (parent2-id uint))
+    (match (map-get? token-metadata parent1-id)
+        parent1-meta (match (map-get? token-metadata parent2-id)
+            parent2-meta (ok (calculate-offspring-traits parent1-meta parent2-meta))
+            ERR-NOT-FOUND)
+        ERR-NOT-FOUND)
+)
+
+(define-public (set-breeding-cost (new-cost uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-cost u0) ERR-INVALID-INPUT)
+        (ok true)
+    )
+)
