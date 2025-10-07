@@ -567,3 +567,181 @@
         (ok true)
     )
 )
+
+(define-constant MIN-RENTAL-DURATION u144)
+(define-constant MAX-RENTAL-DURATION u144000)
+(define-constant RENTAL-PLATFORM-FEE u100)
+
+(define-map rental-listings uint {
+    owner: principal,
+    price-per-block: uint,
+    min-duration: uint,
+    max-duration: uint,
+    available: bool
+})
+
+(define-map active-rentals uint {
+    owner: principal,
+    renter: principal,
+    rental-start: uint,
+    rental-end: uint,
+    total-paid: uint
+})
+
+(define-map renter-history principal (list 20 uint))
+
+(define-read-only (is-rented (token-id uint))
+    (match (map-get? active-rentals token-id)
+        rental (< stacks-block-height (get rental-end rental))
+        false)
+)
+
+(define-read-only (get-current-renter (token-id uint))
+    (match (map-get? active-rentals token-id)
+        rental (if (< stacks-block-height (get rental-end rental))
+            (ok (some (get renter rental)))
+            (ok none))
+        (ok none))
+)
+
+(define-public (list-for-rent (token-id uint) (price-per-block uint) (min-duration uint) (max-duration uint))
+    (let (
+        (token-owner (unwrap! (nft-get-owner? dynamic-nft token-id) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender token-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-rented token-id)) ERR-INVALID-INPUT)
+    (asserts! (> price-per-block u0) ERR-INVALID-PRICE)
+    (asserts! (>= min-duration MIN-RENTAL-DURATION) ERR-INVALID-INPUT)
+    (asserts! (<= max-duration MAX-RENTAL-DURATION) ERR-INVALID-INPUT)
+    (asserts! (>= max-duration min-duration) ERR-INVALID-INPUT)
+    (map-set rental-listings token-id {
+        owner: tx-sender,
+        price-per-block: price-per-block,
+        min-duration: min-duration,
+        max-duration: max-duration,
+        available: true
+    })
+    (ok true)
+    )
+)
+
+(define-public (rent-nft (token-id uint) (duration uint))
+    (let (
+        (listing (unwrap! (map-get? rental-listings token-id) ERR-NOT-FOUND))
+        (token-owner (unwrap! (nft-get-owner? dynamic-nft token-id) ERR-NOT-FOUND))
+        (total-cost (* (get price-per-block listing) duration))
+        (platform-fee (/ (* total-cost RENTAL-PLATFORM-FEE) u10000))
+        (owner-payment (- total-cost platform-fee))
+        (rental-end-block (+ stacks-block-height duration))
+        (renter-list (default-to (list) (map-get? renter-history tx-sender)))
+        (updated-list (unwrap-panic (as-max-len? (append renter-list token-id) u20)))
+    )
+    (asserts! (get available listing) ERR-LISTING-INACTIVE)
+    (asserts! (not (is-rented token-id)) ERR-ALREADY-EXISTS)
+    (asserts! (is-eq token-owner (get owner listing)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq tx-sender token-owner)) ERR-INVALID-INPUT)
+    (asserts! (>= duration (get min-duration listing)) ERR-INVALID-INPUT)
+    (asserts! (<= duration (get max-duration listing)) ERR-INVALID-INPUT)
+    (asserts! (>= (stx-get-balance tx-sender) total-cost) ERR-INSUFFICIENT-FUNDS)
+    (try! (stx-transfer? owner-payment tx-sender token-owner))
+    (try! (stx-transfer? platform-fee tx-sender (var-get marketplace-owner)))
+    (map-set active-rentals token-id {
+        owner: token-owner,
+        renter: tx-sender,
+        rental-start: stacks-block-height,
+        rental-end: rental-end-block,
+        total-paid: total-cost
+    })
+    (map-set rental-listings token-id (merge listing {available: false}))
+    (map-set renter-history tx-sender updated-list)
+    (ok rental-end-block)
+    )
+)
+
+(define-public (end-rental (token-id uint))
+    (let (
+        (rental (unwrap! (map-get? active-rentals token-id) ERR-NOT-FOUND))
+    )
+    (asserts! (>= stacks-block-height (get rental-end rental)) ERR-INVALID-INPUT)
+    (map-delete active-rentals token-id)
+    (ok true)
+    )
+)
+
+(define-public (cancel-rental-listing (token-id uint))
+    (let (
+        (listing (unwrap! (map-get? rental-listings token-id) ERR-NOT-FOUND))
+        (token-owner (unwrap! (nft-get-owner? dynamic-nft token-id) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender token-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get owner listing)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-rented token-id)) ERR-INVALID-INPUT)
+    (map-set rental-listings token-id (merge listing {available: false}))
+    (ok true)
+    )
+)
+
+(define-public (early-return-rental (token-id uint))
+    (let (
+        (rental (unwrap! (map-get? active-rentals token-id) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get renter rental)) ERR-NOT-AUTHORIZED)
+    (asserts! (< stacks-block-height (get rental-end rental)) ERR-INVALID-INPUT)
+    (map-delete active-rentals token-id)
+    (ok true)
+    )
+)
+
+(define-read-only (get-rental-listing (token-id uint))
+    (ok (map-get? rental-listings token-id))
+)
+
+(define-read-only (get-active-rental (token-id uint))
+    (ok (map-get? active-rentals token-id))
+)
+
+(define-read-only (get-rental-status (token-id uint))
+    (match (map-get? active-rentals token-id)
+        rental (let (
+            (is-active (< stacks-block-height (get rental-end rental)))
+            (blocks-remaining (if is-active (- (get rental-end rental) stacks-block-height) u0))
+        )
+        (ok {
+            is-rented: is-active,
+            renter: (get renter rental),
+            owner: (get owner rental),
+            rental-start: (get rental-start rental),
+            rental-end: (get rental-end rental),
+            blocks-remaining: blocks-remaining,
+            total-paid: (get total-paid rental)
+        }))
+        (ok {
+            is-rented: false,
+            renter: tx-sender,
+            owner: tx-sender,
+            rental-start: u0,
+            rental-end: u0,
+            blocks-remaining: u0,
+            total-paid: u0
+        }))
+)
+
+(define-read-only (calculate-rental-cost (token-id uint) (duration uint))
+    (match (map-get? rental-listings token-id)
+        listing (let (
+            (total-cost (* (get price-per-block listing) duration))
+            (platform-fee (/ (* total-cost RENTAL-PLATFORM-FEE) u10000))
+            (owner-receives (- total-cost platform-fee))
+        )
+        (ok {
+            total-cost: total-cost,
+            platform-fee: platform-fee,
+            owner-receives: owner-receives,
+            duration: duration
+        }))
+        ERR-NOT-FOUND)
+)
+
+(define-read-only (get-renter-history (renter principal))
+    (ok (map-get? renter-history renter))
+)
