@@ -1,4 +1,19 @@
 (define-non-fungible-token dynamic-nft uint)
+(define-map external-token-uri { id: uint } { uri: (string-utf8 256) })
+
+(define-public (set-external-token-uri (id uint) (uri (string-utf8 256)))
+  (let ((owner (unwrap! (nft-get-owner? dynamic-nft id) ERR-NOT-FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender owner) ERR-NOT-AUTHORIZED)
+      (map-set external-token-uri { id: id } { uri: uri })
+      (ok true)
+    )
+  )
+)
+
+(define-read-only (get-external-token-uri (id uint))
+  (map-get? external-token-uri { id: id })
+)
 
 (define-data-var last-token-id uint u0)
 (define-data-var contract-owner principal tx-sender)
